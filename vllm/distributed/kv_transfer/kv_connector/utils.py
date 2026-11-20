@@ -43,6 +43,14 @@ BlockIds = tuple[list[int], ...] | list[list[int]]
 # token it computes as if the prompt were plain text.
 MROPE_POSITION_DELTA_KEY = "mrope_position_delta"
 
+# Set by a router that offers a request to an instance only if it is cheap to
+# serve there: the scheduler declines the request, without generating, when more
+# than this many prompt tokens are in neither the local prefix cache nor the KV
+# connector. The declined request finishes with
+# `stop_reason == UNCACHED_PROMPT_LIMIT_STOP_REASON` and no output tokens.
+MAX_UNCACHED_PROMPT_TOKENS_KEY = "max_uncached_prompt_tokens"
+UNCACHED_PROMPT_LIMIT_STOP_REASON = "uncached_prompt_limit"
+
 
 def get_transferred_mrope_position_delta(
     vllm_config: VllmConfig, sampling_params: "SamplingParams | None"

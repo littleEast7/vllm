@@ -79,6 +79,34 @@ decode = client.chat.completions.create(
 
 If `messages` has non-text content, or `echo` or `return_prompt_text` is set, the ids are ignored and `messages` is rendered instead, so it must match the prefill request. Otherwise `kv_transfer_params["prompt_token_ids"]` must be a non-empty list of non-negative integers, or the request fails with HTTP 400, as it always does on `/v1/chat/completions/batch`.
 
+## Offering a request to the decode instance first
+
+!!! note
+    This applies to disaggregated prefill and decode serving. It is experimental and subject to change.
+
+Every request normally visits the prefill instance first, so a few long prompts queueing there delay the first token of all other requests. Some of those requests do not need the prefill instance: the decode instance already holds most of their prompt in its prefix cache, or can load it through a KV connector that reads a shared cache.
+
+A router can offer such a request to the decode instance directly, and let that instance decide. Set `kv_transfer_params["max_uncached_prompt_tokens"]` on a request, without `do_remote_prefill`:
+
+```python
+offer = client.chat.completions.create(
+    model=model,
+    messages=messages,
+    stream=True,
+    extra_body={
+        "return_token_ids": True,
+        "kv_transfer_params": {"max_uncached_prompt_tokens": 160},
+    },
+)
+```
+
+- If at most that many prompt tokens are missing from the instance's prefix cache and KV connector, the request is served as usual.
+- Otherwise the scheduler declines it before allocating anything: the response has no output tokens, `finish_reason` is `"stop"` and `stop_reason` is `"uncached_prompt_limit"`. With `return_token_ids` it still carries `prompt_token_ids`, which the router can [reuse](#reusing-prefill-token-ids-on-decode) when it then sends the request to the prefill instance and back to the decode instance.
+
+A request that started generating is never declined, for example when it resumes after preemption.
+
+The decode instance computes the uncached tokens in the same batches as its running decodes, which lengthens their inter-token latency. Keep the limit small, and offer requests this way only while the prefill instance is backed up. `examples/disaggregated/disaggregated_serving/disagg_proxy_overload_relief.py` is a proxy that does both.
+
 ## Generate API output modes
 
 When the prefill and decode stages use the [Generate API](../serving/online_serving/token_in_token_out.md) (`/inference/v1/generate`), only the decode response reaches the client, so set `output_mode` on the decode request only. A proxy that reuses the client's request body for the prefill request must reset `output_mode` to `tokens` there. A prefill instance started with `--tokens-only` has no tokenizer and rejects `output_mode: "text"` with a 400.

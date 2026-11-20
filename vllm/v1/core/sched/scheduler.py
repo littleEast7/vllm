@@ -22,7 +22,11 @@ from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.ec_transfer.ec_connector.metrics import ECConnectorStats
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
-from vllm.distributed.kv_transfer.kv_connector.utils import MROPE_POSITION_DELTA_KEY
+from vllm.distributed.kv_transfer.kv_connector.utils import (
+    MAX_UNCACHED_PROMPT_TOKENS_KEY,
+    MROPE_POSITION_DELTA_KEY,
+    UNCACHED_PROMPT_LIMIT_STOP_REASON,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
     KVConnectorRole,
@@ -275,6 +279,10 @@ class Scheduler(SchedulerInterface):
         # update_from_output.
         self.grammar_compile_error_reqs: dict[str, RequestError] = {}
         self.encoder_cache_mismatch_reqs: set[str] = set()
+        # Requests declined because their uncached prompt exceeds the caller's
+        # `kv_transfer_params["max_uncached_prompt_tokens"]`; finished without
+        # output in update_from_output.
+        self.uncached_limit_declined_reqs: set[str] = set()
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -1261,6 +1269,13 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
                     assert num_computed_tokens <= request.num_tokens
+                    if self._exceeds_uncached_prompt_limit(
+                        request, num_computed_tokens
+                    ):
+                        # Declined before any block is allocated or KV loaded.
+                        self.uncached_limit_declined_reqs.add(request_id)
+                        skip_request(request_queue)
+                        continue
                     # DSV41 SWA bounded replay: a KV load that carries the
                     # window is taken as is; any other hit no longer than the
                     # replayed window would be recomputed in full and save
@@ -2082,6 +2097,28 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_mismatch_reqs.add(request.request_id)
         return True
 
+    @staticmethod
+    def _exceeds_uncached_prompt_limit(
+        request: Request, num_computed_tokens: int
+    ) -> bool:
+        """Whether a new request asked to be declined at this cache state.
+
+        A caller sets `kv_transfer_params["max_uncached_prompt_tokens"]` to offer
+        a request to this instance only if it can be served cheaply: at most
+        that many prompt tokens are missing from the local prefix cache and the
+        KV connector and would have to be computed here.
+        """
+        params = request.kv_transfer_params
+        if not params:
+            return False
+        limit = params.get(MAX_UNCACHED_PROMPT_TOKENS_KEY)
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            return False
+        if request.num_preemptions > 0 or request.num_output_tokens > 0:
+            # Already admitted once; never turn away a request mid-generation.
+            return False
+        return request.num_tokens - num_computed_tokens > limit
+
     def _allocate_encoder_inputs(
         self,
         request: Request,
@@ -2658,6 +2695,25 @@ class Scheduler(SchedulerInterface):
             # An encoder input the connector can no longer obtain. Failing is
             # retryable: re-issuing the request re-runs the encode.
             error_req_ids.update(self.ec_connector.take_unavailable_requests())
+
+        if self.uncached_limit_declined_reqs:
+            # Not an error: the caller asked to be turned away, and the normal
+            # response path reports it (with the prompt token ids, if requested).
+            declined_reqs = self.finish_requests(
+                self.uncached_limit_declined_reqs, RequestStatus.FINISHED_STOPPED
+            )
+            self.uncached_limit_declined_reqs = set()
+            for request in declined_reqs:
+                outputs[request.client_index].append(
+                    EngineCoreOutput(
+                        request_id=request.request_id,
+                        new_token_ids=[],
+                        finish_reason=request.get_finished_reason(),
+                        stop_reason=UNCACHED_PROMPT_LIMIT_STOP_REASON,
+                        events=request.take_events(),
+                        trace_headers=request.trace_headers,
+                    )
+                )
 
         if error_req_ids:
             error_reqs = self.finish_requests(
